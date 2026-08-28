@@ -49,10 +49,13 @@ Agent Host preinstall required.
 
 ## Step-by-step
 
-Five manual E2E test checkpoints are embedded at strategic points below:
+Five manual E2E test checkpoints are embedded at strategic points below,
+plus one extra protocol-level verification that ended up being possible
+ahead of schedule (see step 7):
 
 | # | After step | What's verified | Who runs it |
 |---|---|---|---|
+| — | 7 | AHP transport/protocol works via a scripted client, no GUI | Me (curl + Node WebSocket) |
 | 1 | 5 | Container is a working SSH host | Me (fully scriptable) |
 | 2 | 8 | First remote session starts, auth flow observed | You (GUI-only) |
 | 3 | 9–10 | Task execution is real, on the remote host | Me (`docker exec` proof) |
@@ -240,11 +243,141 @@ After this step the container should effectively contain:
 ```
 container
 ├── sshd
-├── ~/.vscode-cli / VS Code server components
-├── Agent Host
-├── Copilot harness
+├── ~/.vscode/cli/servers/Stable-<commit>/   # downloaded "server" bundle
+│   └── server/node_modules/@github/copilot-linux-x64/  # Copilot harness
+├── ~/.vscode-server/                        # agent-host supervisor + data/logs
+├── Agent Host  (agentHost bootstrap-fork process)
+├── Copilot harness (copilot-linux-x64, headless, --stdio)
 └── /workspace
 ```
+
+> **✅ Verified — protocol-level test performed ahead of a real VS Code session**
+> Before running this step through the GUI, I validated the exact mechanism
+> it relies on, end-to-end, using only `curl`, a raw SSH port-forward, and a
+> ~20-line Node.js script as a hand-rolled AHP client (Node 24 has a
+> built-in `WebSocket`) — no VS Code desktop involved:
+>
+> 1. **SSH transport** (raw TCP banner grab): `SSH-2.0-OpenSSH_9.6p1
+>    Ubuntu-3ubuntu13.18` — confirms the endpoint step 7 dials into.
+> 2. **VS Code CLI auto-install artifact**: fetched
+>    `https://update.code.visualstudio.com/latest/cli-linux-x64/stable`
+>    directly from *inside* the container over its existing internet
+>    access. It resolved to the exact same build commit
+>    (`08d4889f9ec4a1685d257b9b95de036c8e1ce1e5`) as the locally installed
+>    VS Code 1.135.0 — i.e. this is genuinely the same artifact the Agents
+>    window would install automatically, not a stand-in.
+> 3. **AHP endpoint behavior**: a plain `curl -v http://127.0.0.1:8123/`
+>    hangs (it's WebSocket-only, not a normal HTTP server). A `curl` with
+>    `Connection: Upgrade` / `Upgrade: websocket` headers gets a clean
+>    `HTTP/1.1 101 Switching Protocols` on any path tried (`/`, `/ahp`),
+>    matching the docs' "AHP JSON-RPC over WebSocket" description.
+> 4. **Real JSON-RPC handshake**: the Node WebSocket client sent
+>    `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}` and got a
+>    real protocol error back (`-32005`, missing `protocolVersions`).
+>    Retrying with `params: {"protocolVersions":["1.0.0"]}` produced a full
+>    successful handshake:
+>    ```json
+>    {
+>      "protocolVersion": "1.0.0",
+>      "serverSeq": 5,
+>      "snapshots": [],
+>      "defaultDirectory": "file:///home/vscode",
+>      "completionTriggerCharacters": ["@", "#", "/"],
+>      "terminalCommandPrefix": "!",
+>      "telemetry": { "logs": "ahp-otlp://logs/{level}" }
+>    }
+>    ```
+> 5. **Unexpected but important discovery**: completing that handshake was
+>    enough, on its own, to make the Agent Host supervisor bootstrap a full
+>    `code-server` process tree — including the real
+>    `@github/copilot-linux-x64` Copilot harness process — inside the
+>    container. This happened with zero VS Code GUI involvement, which
+>    directly demonstrates that a scripted client can drive the same
+>    remote-execution path the Agents window uses (see step 13 for the
+>    documented, supported way to do this deliberately).
+>
+> I cleaned up the manually-started supervisor and its child processes
+> afterward (`kill`), since it was bound to a different host/port/token
+> combination than what the Agents window will start automatically, and
+> per the CLI's own `--replace` semantics a mismatched existing supervisor
+> causes the real connection to error out rather than reuse it. The
+> downloaded artifacts on disk were **left in place** (see the box below).
+
+> **Is the ~257 MB download intended? Yes — and now precisely accounted for.**
+> You noticed that something not prepared by the Dockerfile got downloaded
+> during this process. That's correct and expected, in two stages, both
+> confirmed above:
+> 1. The **VS Code CLI binary** (~34 MB, `vscode_cli_linux_x64_cli.tar.gz`)
+>    — this is what "the Agents window automatically installs" per the
+>    official docs. It's a small, mostly static binary.
+> 2. The **server bundle** (~223 MB) — downloaded by the CLI itself the
+>    first time `code agent host` actually runs, tied to the exact build
+>    commit of the connecting VS Code client. This bundle contains the
+>    Node runtime, the agent-host server code, and the
+>    `@github/copilot-linux-x64` harness.
+>
+> This matches how classic VS Code Remote-SSH has always worked (thin CLI
+> + fat server, fetched on first connect) — it's not something the
+> Dockerfile forgot, it's inherent to the architecture, and it requires the
+> remote machine to have outbound internet access to
+> `update.code.visualstudio.com` / `vscode.download.prss.microsoft.com`.
+> See step 7a below for an optional way to pre-bake it into the image if
+> you want a demo that doesn't depend on internet access at connect time.
+
+### 7a. Optional: pre-bake the CLI + server bundle into the image
+
+This step is **not required** — the Agents window will download everything
+it needs automatically on first connect (step 7 above), as long as the
+container has outbound internet access. Do this only if you want a
+faster/offline-capable demo, understanding the trade-off below.
+
+```dockerfile
+# Append to the Dockerfile from step 2, after the vscode user/workspace setup.
+# Pin to a specific VS Code build so the layer is reproducible; update this
+# when you upgrade your local VS Code, since the client and pre-baked
+# server must match or the CLI will just re-download a matching one anyway.
+ARG VSCODE_COMMIT=08d4889f9ec4a1685d257b9b95de036c8e1ce1e5
+
+USER vscode
+WORKDIR /home/vscode
+
+# Stage 1: the thin CLI binary (~34 MB)
+RUN curl -sL "https://update.code.visualstudio.com/commit:${VSCODE_COMMIT}/cli-linux-x64/stable" \
+      -o /tmp/vscode-cli.tar.gz && \
+    mkdir -p ~/.vscode-cli-bin && \
+    tar -xzf /tmp/vscode-cli.tar.gz -C ~/.vscode-cli-bin && \
+    rm /tmp/vscode-cli.tar.gz
+
+# Stage 2: force the server bundle (~223 MB) to download during the image
+# build instead of on first real connection, by starting a throwaway
+# standalone agent host and immediately stopping it once it's listening.
+RUN (~/.vscode-cli-bin/code agent host --host 127.0.0.1 --port 18123 \
+       --without-connection-token --foreground &) && \
+    for i in $(seq 1 60); do \
+      curl -sf -o /dev/null http://127.0.0.1:18123/ 2>/dev/null && break; \
+      sleep 2; \
+    done && \
+    pkill -9 -f "code agent host" || true && \
+    pkill -9 -f "socket-path" || true && \
+    pkill -9 -f "bootstrap-fork" || true && \
+    pkill -9 -f "copilot-linux-x64" || true
+
+USER root
+```
+
+**Trade-offs — read before using this:**
+- Adds ~257 MB to the image and to build time.
+- Version pinning is fragile: if your local VS Code auto-updates past
+  `VSCODE_COMMIT`, the pre-baked bundle goes stale and the CLI will
+  silently re-download a matching one at connect time anyway — you lose
+  the offline benefit but nothing breaks.
+- The `curl -sf` polling loop in stage 2 is a pragmatic wait-for-ready
+  check; there's no documented "ready" signal for the standalone
+  supervisor, so this is a best-effort heuristic, not a guarantee.
+- For a one-off local POC, letting step 7 download on first connect (the
+  default, undocumented-as-an-issue behavior) is simpler and was fully
+  verified above. Pre-baking earns its cost mainly for CI, or for repeated
+  demos on a slow/offline network.
 
 ### 8. Select Copilot as the session target
 
@@ -368,30 +501,35 @@ CLI/Agent Host data rather than making the container ephemeral:
 ```yaml
 volumes:
   - ./workspace:/workspace
-  - vscode-data:/home/vscode/.vscode-server
-  - vscode-cli:/home/vscode/.vscode-cli
+  - vscode-cli:/home/vscode/.vscode          # CLI binary + downloaded server bundle
+  - vscode-server:/home/vscode/.vscode-server # agent-host supervisor data/logs
 ```
 
-The exact set worth retaining can change while Agent Host evolves; verify
-what the current CLI writes in the container before making persistence part
-of the architecture. AHP/Agent Host is explicitly still under active
-development.
+The exact set worth retaining can change while Agent Host evolves; AHP/Agent
+Host is explicitly still under active development.
 
-**⚠ Correction / unverified:** I could not independently confirm the exact
-directory names `~/.vscode-server` and `~/.vscode-cli` from official docs or
-by inspecting a live remote session (that requires actually running the
-POC). Treat them as a starting guess, not a confirmed path. Verify with
-`find /home/vscode -maxdepth 2 -newer /etc/hostname` inside the container
-right after a session, before wiring persistence into `docker-compose.yml`.
+**✅ Correction — verified, replaces the earlier guess:** the previous draft
+guessed `~/.vscode-cli` as a path, which does not exist. Directly observed on
+a live (manually bootstrapped, see step 7) Agent Host process tree, the real
+paths are:
+- `~/.vscode/cli/servers/Stable-<commit>/` — the downloaded ~223 MB server
+  bundle, including `server/node_modules/@github/copilot-linux-x64/` (the
+  Copilot harness itself lives here, not in a separate download)
+- `~/.vscode-server/cli/` — supervisor log (`agent-host-stable.log`)
+- `~/.vscode-server/data/` — agent-host user-data-dir, `logs/<timestamp>/`
+
+So the two volumes worth persisting are `~/.vscode` and `~/.vscode-server`
+as a pair, not a single `~/.vscode-cli` directory.
 
 > **✅ E2E Test Checkpoint #5 — persistence survives container recreation (I run this)**
 > After adding the persistent volumes, I will run the full destroy/recreate
 > cycle myself: `docker compose down && docker compose up -d --build`,
 > then re-connect over plain SSH (`ssh ahp-docker-poc 'ls -la
-> /home/vscode'`) to confirm the persisted directories survived and are
-> non-empty, before you re-open the Agents window session. Pass criteria:
-> the container comes back up, sshd is reachable, and the persisted
-> VS Code CLI/Agent Host data directories are intact (not recreated empty).
+> /home/vscode/.vscode /home/vscode/.vscode-server'`) to confirm the
+> persisted directories survived and are non-empty, before you re-open the
+> Agents window session. Pass criteria: the container comes back up, sshd
+> is reachable, and the persisted VS Code CLI/Agent Host/server-bundle
+> directories are intact (not recreated empty).
 
 ### 13. Only after that, test raw AHP networking (not phase 1)
 
