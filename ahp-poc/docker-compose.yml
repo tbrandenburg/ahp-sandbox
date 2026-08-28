@@ -1,0 +1,12 @@
+services:
+  agent-host:
+    build: .
+    container_name: ahp-poc
+    ports:
+      - "127.0.0.1:2222:22"
+    volumes:
+      - ./workspace:/workspace
+      - agent-home:/home/vscode
+    restart: unless-stopped
+volumes:
+  agent-home:
