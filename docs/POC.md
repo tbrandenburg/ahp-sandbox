@@ -49,6 +49,16 @@ Agent Host preinstall required.
 
 ## Step-by-step
 
+Five manual E2E test checkpoints are embedded at strategic points below:
+
+| # | After step | What's verified | Who runs it |
+|---|---|---|---|
+| 1 | 5 | Container is a working SSH host | Me (fully scriptable) |
+| 2 | 8 | First remote session starts, auth flow observed | You (GUI-only) |
+| 3 | 9–10 | Task execution is real, on the remote host | Me (`docker exec` proof) |
+| 4 | 11 | Session survives client disconnect/reconnect | Joint (you disconnect, I poll) |
+| 5 | 12 | Persisted state survives container recreation | Me (destroy/recreate cycle) |
+
 ### 1. Prove Copilot works locally first
 
 Use a current VS Code Stable or Insiders, sign into GitHub with a
@@ -186,6 +196,14 @@ ls -la /workspace
 
 All of these should work before troubleshooting anything AHP-related.
 
+> **✅ E2E Test Checkpoint #1 — container is a working SSH host**
+> Before touching VS Code at all, I will run this checkpoint myself
+> end-to-end from the shell: `docker compose up -d --build`, then
+> `ssh -i ~/.ssh/ahp-poc -p 2222 vscode@127.0.0.1 'whoami && git --version && node --version && ls -la /workspace'`.
+> Pass criteria: the SSH connection succeeds non-interactively and all four
+> commands return output with exit code 0. This is fully scriptable/CLI-only,
+> so I can execute and verify it without any human involvement.
+
 ### 6. Give the container an SSH alias
 
 Add to local `~/.ssh/config`:
@@ -255,6 +273,15 @@ a session. Budget time for a possible extra "sign in to GitHub" prompt the
 first time you select Copilot as the session target against the remote
 host, and don't treat it as a failure if it happens.
 
+> **✅ E2E Test Checkpoint #2 — first remote session start (human-in-the-loop)**
+> Steps 7–8 drive the VS Code desktop GUI (Agents window, Session Target
+> picker), which I cannot operate directly. At this point I hand control to
+> you: confirm the SSH connection was picked up, Folder isolation and
+> Default Approvals were selected, and note whether a separate GitHub
+> sign-in prompt appeared on the remote host. Report back so the remaining
+> checkpoints (which I can verify from the shell) have a starting session
+> to check against.
+
 ### 9. Run a task that proves backend execution
 
 Don't use a trivial "explain this code" prompt. Make Copilot demonstrate
@@ -295,6 +322,16 @@ running there.
 At this point: VS Code is the UI/client; the agent runtime and workspace
 execution are containerized.
 
+> **✅ E2E Test Checkpoint #3 — remote execution proof (I run this)**
+> Once you report that the Copilot task in step 9 has completed, I will run
+> the same `docker exec` diff/process inspection myself from the shell,
+> independently of what VS Code shows you: `docker exec ahp-poc bash -lc
+> 'cd /workspace && git diff --stat && npm test'`. Pass criteria: the
+> `/health` endpoint and its test exist on disk inside the container, `git
+> diff --stat` shows the expected file changes, and `npm test` passes when
+> re-run by me from outside VS Code. This is the strongest evidence that
+> execution happened on the remote host and not just in the VS Code client.
+
 ### 11. Test AHP's interesting property: disconnect/reconnect
 
 Give Copilot a slightly longer task, then disconnect the VS Code client from
@@ -312,6 +349,16 @@ Verify that the same session and its progress are still there.
 
 This is the most important demo moment — it shows the Agent Host/AHP
 separation, not just "Copilot in Remote SSH."
+
+> **✅ E2E Test Checkpoint #4 — disconnect/reconnect (joint: you disconnect, I verify state)**
+> After you disconnect VS Code in step 11, I will poll the container from
+> the shell (`docker exec ahp-poc ps aux | grep -i agent`, repeated `git
+> status`/`git diff` snapshots a few seconds apart) to confirm the session
+> keeps progressing with no client attached. When you reconnect and confirm
+> the session/history is still there in the UI, I will do one final `docker
+> exec` diff to confirm the on-disk state matches what the UI reports. Pass
+> criteria: file changes continue to appear between my snapshots while VS
+> Code is disconnected, and the final state matches after reconnect.
 
 ### 12. Add persistence across container recreation
 
@@ -336,6 +383,15 @@ by inspecting a live remote session (that requires actually running the
 POC). Treat them as a starting guess, not a confirmed path. Verify with
 `find /home/vscode -maxdepth 2 -newer /etc/hostname` inside the container
 right after a session, before wiring persistence into `docker-compose.yml`.
+
+> **✅ E2E Test Checkpoint #5 — persistence survives container recreation (I run this)**
+> After adding the persistent volumes, I will run the full destroy/recreate
+> cycle myself: `docker compose down && docker compose up -d --build`,
+> then re-connect over plain SSH (`ssh ahp-docker-poc 'ls -la
+> /home/vscode'`) to confirm the persisted directories survived and are
+> non-empty, before you re-open the Agents window session. Pass criteria:
+> the container comes back up, sshd is reachable, and the persisted
+> VS Code CLI/Agent Host data directories are intact (not recreated empty).
 
 ### 13. Only after that, test raw AHP networking (not phase 1)
 
